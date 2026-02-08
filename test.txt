@@ -1,0 +1,200 @@
+import asyncio
+import os
+import shutil
+import nest_asyncio
+from urllib.parse import quote
+from aiogram import F, Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from shazamio import Shazam
+from audio_separator.separator import Separator
+
+nest_asyncio.apply()
+
+# --- КОНФИГ ---
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+shazam = Shazam()
+
+# Хранилище языков в памяти (сбросится при перезапуске бота)
+user_languages = {}
+
+# Инициализация ИИ (модель Kim_Inst быстрее и лучше для Shazam)
+global_separator = Separator(output_format='WAV')
+print("🤖 Загрузка ИИ модели Kim_Inst... Подождите...")
+global_separator.load_model('Kim_Inst.onnx')
+
+# --- ЛОКАЛИЗАЦИЯ ---
+MESSAGES = {
+    'ru': {
+        'start': "👋 Привет в **StemFinder**! \n\nЯ найду песню, даже если там громкий голос. Пришли мне аудио или голосовое (до 20 сек).",
+        'select_lang': "Выберите язык / Select language:",
+        'processing': "⏳ Работаю над файлом...",
+        'ai_start': "❌ Не узнал... Включаю ИИ-очистку голоса... 🧠",
+        'ai_final': "🧠 Голос удален. Ищу по чистому минусу...",
+        'not_found': "😔 Даже ИИ не смог узнать этот трек.",
+        'error': "⚠️ Произошла ошибка. Попробуй еще раз.",
+        'btn_spotify': "🟢 Спотифай",
+        'btn_apple': "🍎 Эпл Музыка"
+    },
+    'en': {
+        'start': "👋 Welcome to **StemFinder**! \n\nI can find songs even with loud vocals. Send me audio or voice (up to 20s).",
+        'select_lang': "Select your language / Выберите язык:",
+        'processing': "⏳ Processing your file...",
+        'ai_start': "❌ Not recognized. Starting AI vocal removal... 🧠",
+        'ai_final': "🧠 Vocals removed. Searching by instrumental...",
+        'not_found': "😔 Even AI couldn't recognize this track.",
+        'error': "⚠️ An error occurred. Please try again.",
+        'btn_spotify': "🟢 Spotify",
+        'btn_apple': "🍎 Apple Music"
+    }
+}
+
+# --- УТИЛИТЫ ---
+def prepare_user_dir(user_id):
+    user_dir = f"downloads/{user_id}"
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+# --- ХЕНДЛЕРЫ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+
+    # Если язык еще не выбран — предлагаем выбрать
+    if user_id not in user_languages:
+        buttons = [
+            [InlineKeyboardButton(text="Русский 🇷🇺", callback_data="setlang_ru")],
+            [InlineKeyboardButton(text="English 🇺🇸", callback_data="setlang_en")]
+        ]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(MESSAGES['en']['select_lang'], reply_markup=keyboard)
+    else:
+        lang = user_languages[user_id]
+        await message.answer(MESSAGES[lang]['start'], parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("setlang_"))
+async def set_lang(call: CallbackQuery):
+    lang = call.data.split("_")[1]
+    user_languages[call.from_user.id] = lang
+    await call.message.edit_text(MESSAGES[lang]['start'], parse_mode="Markdown")
+
+@dp.message(F.audio | F.voice)
+async def handle_audio(message: Message):
+    user_id = message.from_user.id
+    lang = user_languages.get(user_id, 'en') # По умолчанию английский
+    user_dir = prepare_user_dir(user_id)
+
+    audio_obj = message.audio if message.audio else message.voice
+
+    # Ограничение по времени
+    if audio_obj.duration > 25:
+        return await message.reply("Too long! Max 25s / Слишком длинное! Макс 25 сек.")
+
+    status_msg = await message.answer(MESSAGES[lang]['processing'])
+
+    file_id = audio_obj.file_id
+    # Используем os.path.join, чтобы не было ошибок с путями
+    input_path = os.path.join(user_dir, f"{file_id}_in.raw")
+    output_wav = os.path.join(user_dir, f"{file_id}_out.wav")
+
+    try:
+        # 1. Скачивание
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, input_path)
+
+        # 2. Конвертация в моно/44100Гц (идеально для Shazam)
+        process = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-i', input_path,
+            '-ar', '44100', '-ac', '1',
+            '-af', 'loudnorm',
+            output_wav, '-y'
+        )
+        await process.wait()
+
+        # 3. Поиск 1: По оригиналу
+        out = await shazam.recognize_song(output_wav)
+
+        # Если не нашли — запускаем ИИ
+        if not out.get('track'):
+            await status_msg.edit_text(MESSAGES[lang]['ai_start'])
+
+            # Диктуем сепаратору папку юзера
+            global_separator.output_dir = user_dir
+            loop = asyncio.get_event_loop()
+
+            # Разделяем (запускаем в executor, чтобы не фризить бота)
+            output_files = await loop.run_in_executor(None, global_separator.separate, output_wav)
+
+            instr_file = None
+            for f in output_files:
+                # Очищаем имя от лишних кавычек
+                clean_f = f.strip("'\"")
+                if 'Instrumental' in clean_f:
+                    # Проверяем, где файл: в корне или в папке юзера
+                    if os.path.exists(clean_f):
+                        instr_file = os.path.join(user_dir, clean_f)
+                        shutil.move(clean_f, instr_file)
+                    elif os.path.exists(os.path.join(user_dir, clean_f)):
+                        instr_file = os.path.join(user_dir, clean_f)
+                    break
+
+            if instr_file:
+                await status_msg.edit_text(MESSAGES[lang]['ai_final'])
+
+                # Усиливаем "минус" для лучшего распознавания
+                boosted = os.path.join(user_dir, "boosted_instr.wav")
+                process = await asyncio.create_subprocess_exec(
+                    'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                    '-i', instr_file,
+                    '-af', 'highpass=f=200,lowpass=f=4000,loudnorm',
+                    boosted, '-y'
+                )
+                await process.wait()
+
+                # Поиск 2: По очищенному минусу
+                out = await shazam.recognize_song(boosted)
+
+        # 4. РЕЗУЛЬТАТ
+        if out.get('track'):
+            title = out['track']['title']
+            artist = out['track']['subtitle']
+
+            # Кодируем запрос для ссылок
+            safe_q = quote(f"{artist} {title}")
+
+            buttons = [
+                [InlineKeyboardButton(text=MESSAGES[lang]['btn_spotify'], url=f"https://www.google.com/search?q=spotify+music+{safe_q}")],
+                [InlineKeyboardButton(text=MESSAGES[lang]['btn_apple'], url=out['track'].get('url', f"https://music.apple.com/search?term={safe_q}"))]
+            ]
+
+            await status_msg.edit_text(
+                f"✅ **{title}**\n👤 {artist}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text(MESSAGES[lang]['not_found'])
+
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        await status_msg.edit_text(MESSAGES[lang]['error'])
+
+    finally:
+        # Полная очистка временных файлов пользователя
+        if os.path.exists(user_dir):
+            shutil.rmtree(user_dir, ignore_errors=True)
+
+async def main():
+    # Удаляем вебхуки и запускаем поллинг
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🚀 StemFinder запущен и готов к работе!")
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Бот остановлен")
